@@ -746,14 +746,15 @@ mod tests {
 
     use camino::Utf8Path;
     use claim::*;
-    use futures_util::Future;
-    use gitlab_runner::{GitlabLayer, Runner};
+    use gitlab_runner::{GitlabLayer, Runner, RunnerBuilder};
     use gitlab_runner_mock::*;
     use open_build_service_mock::*;
-    use rstest::{fixture, rstest};
+    use rstest::rstest;
     use tempfile::TempDir;
-    use tracing::{instrument::WithSubscriber, Level};
-    use tracing_subscriber::{filter::Targets, prelude::*, Layer, Registry};
+    use tracing::{instrument::WithSubscriber, Level, Subscriber};
+    use tracing_subscriber::{
+        filter::Targets, layer::SubscriberExt, registry::LookupSpan, Layer, Registry,
+    };
     use zip::ZipArchive;
 
     use crate::{test_support::*, upload::compute_md5};
@@ -787,17 +788,24 @@ mod tests {
         obs_client: obs::Client,
     }
 
-    #[fixture]
-    async fn test_context() -> (TestContext, GitlabLayer) {
+    async fn test_context<S>() -> (TestContext, impl Layer<S>)
+    where
+        S: Subscriber + 'static + Send + Sync,
+        S: for<'span> LookupSpan<'span>,
+    {
         COLOR_EYRE_INSTALL.call_once(|| color_eyre::install().unwrap());
 
         let runner_dir = tempfile::tempdir().unwrap();
+        let (layer, jobs) = GitlabLayer::new();
         let gitlab_mock = GitlabRunnerMock::start().await;
-        let (runner, layer) = Runner::new_with_layer(
+        let runner = RunnerBuilder::new(
             gitlab_mock.uri(),
             gitlab_mock.runner_token().to_owned(),
             runner_dir.path().to_owned(),
-        );
+            jobs,
+        )
+        .build()
+        .await;
 
         let obs_mock = create_default_mock().await;
         let obs_client = create_default_client(&obs_mock);
@@ -814,24 +822,18 @@ mod tests {
         )
     }
 
-    async fn with_tracing<T, Fut>(layer: GitlabLayer, future: Fut) -> T
-    where
-        Fut: Future<Output = T>,
-    {
-        future
-            .with_subscriber(
-                Registry::default()
-                    .with(
-                        tracing_subscriber::fmt::layer()
-                            .with_test_writer()
-                            .with_filter(
-                                Targets::new().with_target("obs_gitlab_runner", Level::TRACE),
-                            ),
-                    )
-                    .with(tracing_error::ErrorLayer::default())
-                    .with(layer),
-            )
-            .await
+    macro_rules! with_tracing {
+        ($layer:expr, $future:expr) => {{
+            let sub = Registry::default()
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_test_writer()
+                        .with_filter(Targets::new().with_target("obs_gitlab_runner", Level::TRACE)),
+                )
+                .with(tracing_error::ErrorLayer::default())
+                .with($layer);
+            $future.with_subscriber(sub).await
+        }};
     }
 
     #[derive(Default)]
@@ -1713,7 +1715,6 @@ mod tests {
     #[rstest]
     #[tokio::test]
     async fn test_handler_flow(
-        #[future] test_context: (TestContext, GitlabLayer),
         #[values(
             DputTest::Basic,
             DputTest::Rebuild,
@@ -1731,8 +1732,8 @@ mod tests {
         #[values(true, false)] download_binaries: bool,
         #[values(true, false)] prune_only_if_job_unsuccessful: bool,
     ) {
-        let (mut context, layer) = test_context.await;
-        with_tracing(layer, async {
+        let (mut context, layer) = test_context().await;
+        with_tracing!(layer, async {
             let (dput, build_info) = test_dput(&mut context, dput_test).await;
 
             test_monitoring(
@@ -1753,15 +1754,14 @@ mod tests {
                 prune_only_if_job_unsuccessful,
             )
             .await;
-        })
-        .await;
+        });
     }
 
     #[rstest]
     #[tokio::test]
-    async fn test_variable_expansion(#[future] test_context: (TestContext, GitlabLayer)) {
-        let (mut context, layer) = test_context.await;
-        with_tracing(layer, async {
+    async fn test_variable_expansion() {
+        let (mut context, layer) = test_context().await;
+        with_tracing!(layer, async {
             let job = enqueue_job(
                 &context,
                 JobSpec {
@@ -1785,15 +1785,14 @@ mod tests {
                 job_log.lines().last().unwrap(),
                 ";$ESCAPED;spaces should be preserved;recursion()"
             );
-        })
-        .await;
+        });
     }
 
     #[rstest]
     #[tokio::test]
-    async fn test_flag_parsing(#[future] test_context: (TestContext, GitlabLayer)) {
-        let (mut context, layer) = test_context.await;
-        with_tracing(layer, async {
+    async fn test_flag_parsing() {
+        let (mut context, layer) = test_context().await;
+        with_tracing!(layer, async {
             let job = enqueue_job(
                 &context,
                 JobSpec {
@@ -1850,8 +1849,7 @@ mod tests {
 
             run_obs_handler(&mut context).await;
             assert_eq!(job.state(), MockJobState::Failed);
-        })
-        .await;
+        });
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -1863,7 +1861,6 @@ mod tests {
     #[rstest]
     #[tokio::test]
     async fn test_generate_monitor_timeouts(
-        #[future] test_context: (TestContext, GitlabLayer),
         #[values(
             None,
             Some(GenerateMonitorTimeoutLocation::HandlerOption),
@@ -1873,8 +1870,8 @@ mod tests {
     ) {
         const TEST_MONITOR_TIMEOUT: &str = "10 minutes";
 
-        let (mut context, layer) = test_context.await;
-        with_tracing(layer, async {
+        let (mut context, layer) = test_context().await;
+        with_tracing!(layer, async {
             let build_info = ObsBuildInfo {
                 project: TEST_PROJECT.to_owned(),
                 package: TEST_PACKAGE_1.to_owned(),
@@ -1958,7 +1955,6 @@ mod tests {
             } else {
                 assert_none!(timeout_yaml);
             }
-        })
-        .await;
+        });
     }
 }
